@@ -1,0 +1,442 @@
+# updated to just get the encoder embeddings
+
+from typing import Optional, Tuple
+
+import k2
+import torch
+import torch.nn as nn
+from encoder_interface import EncoderInterface
+from scaling import ScaledLinear
+
+from icefall.utils import add_sos, make_pad_mask #needs change
+import torch.nn.functional as F
+from typing import Dict, Union, OrderedDict, Any, Optional, List
+import logging
+import re
+
+class Permute(nn.Module):
+    def __init__(self, *dims):
+        super().__init__()
+        self.dims = dims
+
+    def forward(self, x):
+        return x.permute(*self.dims)
+
+
+def causal_conv1d_ref(
+    x,
+    weight,
+    bias=None,
+    initial_states=None,
+    return_final_states=False,
+    final_states_out=None,
+    activation=None,
+):
+    """
+    Pure Python reference implementation of CausalConv1d.
+    x: (batch, dim, seqlen)
+    weight: (dim, width)
+    bias: (dim,)
+    initial_states: (batch, dim, width - 1)
+    final_states_out: (batch, dim, width - 1)
+    out: (batch, dim, seqlen)
+    """
+    if activation not in [None, "silu", "swish"]:
+        raise NotImplementedError("activation must be None, silu, or swish")
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    seqlen = x.shape[-1]
+    dim, width = weight.shape
+    if initial_states is None:
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
+    else:
+        x = torch.cat([initial_states, x], dim=-1)
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
+    out = out[..., :seqlen]
+    if return_final_states:
+        final_states = F.pad(x, (width - 1 - x.shape[-1], 0)).to(dtype_in)
+        if final_states_out is not None:
+            final_states_out.copy_(final_states)
+        else:
+            final_states_out = final_states
+    out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+    return out if not return_final_states else (out, final_states_out)
+
+
+class CausalConv1d(nn.Module):
+    """
+    Causal 1D convolution layer implemented using F.conv1d.
+    This version does not require a C++ extension and is fully compatible with any
+    PyTorch version.
+    """
+    def __init__(self, dim, width, activation=None):
+        super().__init__()
+        assert width >= 1, "width must be >= 1"
+        self.dim = dim
+        self.width = width
+        self.activation = activation
+        self.weight = nn.Parameter(torch.empty(dim, width))
+        self.bias = nn.Parameter(torch.empty(dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.weight, a=2**0.5)
+        torch.nn.init.constant_(self.bias, 0.0)
+
+    def forward(self, x, initial_states=None, return_final_states=False):
+        """
+        x: (batch, dim, seqlen)
+        """
+        return causal_conv1d_ref(
+            x,
+            self.weight,
+            self.bias,
+            initial_states=initial_states,
+            return_final_states=return_final_states,
+            activation=self.activation,
+        )
+
+
+def extract_intent_from_supervision(text: str) -> str:
+    text = text.strip()
+    match = re.search(r'(<[^>]+>)$', text)
+    if match:
+        token = match.group(1)
+        if not token.startswith("▁"):
+          token = "▁" + token
+        return token
+    else:
+        return None
+
+some_mapping = {
+
+  "▁<iot_hue_lightoff>": 0,
+  "▁<cooking_recipe>": 1,
+  "▁<recommendation_locations>": 2,
+  "▁<iot_hue_lightdim>": 3,
+  "▁<lists_createoradd>": 4,
+  "▁<podcasts>": 5,
+  "▁<transport_taxi>": 6,
+  "▁<alarm_set>": 7,
+  "▁<greet>": 8,
+  "▁<recommendation_events>": 9,
+  "▁<takeaway_query>": 10,
+  "▁<currency>": 11,
+  "▁<traffic>": 12,
+  "▁<recommendation_movies>": 13,
+  "▁<play_audiobook>": 14,
+  "▁<takeaway_order>": 15,
+  "▁<general_quirky>": 16,
+  "▁<radio>": 17,
+  "▁<iot_hue_lightup>": 18,
+  "▁<play_game>": 19,
+  "▁<sendemail>": 20,
+  "▁<music_settings>": 21,
+  "▁<factoid>": 22,
+  "▁<ticket>": 23,
+  "▁<iot_wemo_off>": 24,
+  "▁<set>": 25,
+  "▁<addcontact>": 26,
+  "▁<play_podcasts>": 27,
+  "▁<alarm_query>": 28,
+  "▁<datetime_convert>": 29,
+  "▁<email_querycontact>": 30,
+  "▁<hue_lightup>": 31,
+  "▁<calendar_query>": 32,
+  "▁<play_music>": 33,
+  "▁<calendar_set>": 34,
+  "▁<quirky>": 35,
+  "▁<hue_lightoff>": 36,
+  "▁<calendar_remove>": 37,
+  "▁<iot_coffee>": 38,
+  "▁<unk>": 39,
+  "▁<remove>": 40,
+  "▁<volume_other>": 41,
+  "▁<social_query>": 42,
+  "▁<cooking_query>": 43,
+  "▁<audio_volume_down>": 44,
+  "▁<music_query>": 45,
+  "▁<qa_maths>": 46,
+  "▁<email_query>": 47,
+  "▁<social_post>": 48,
+  "▁<alarm_remove>": 49,
+  "▁<lists_remove>": 50,
+  "▁<iot_hue_lighton>": 51,
+  "▁<qa_factoid>": 52,
+  "▁<post>": 53,
+  "▁<datetime_query>": 54,
+  "▁<audio_volume_other>": 55,
+  "▁<joke>": 56,
+  "▁<transport_query>": 57,
+  "▁<audio_volume_up>": 58,
+  "▁<general_greet>": 59,
+  "▁<general_joke>": 60,
+  "▁<audio_volume_mute>": 61,
+  "▁<events>": 62,
+  "▁<news_query>": 63,
+  "▁<email_sendemail>": 64,
+  "▁<cleaning>": 65,
+  "▁<settings>": 66,
+  "▁<coffee>": 67,
+  "▁<email_addcontact>": 68,
+  "▁<game>": 69,
+  "▁<qa_currency>": 70,
+  "▁<transport_traffic>": 71,
+  "▁<qa_definition>": 72,
+  "▁<convert>": 73,
+  "▁<createoradd>": 74,
+  "▁<iot_wemo_on>": 75,
+  "▁<lists_query>": 76,
+  "▁<play_radio>": 77,
+  "▁<weather_query>": 78,
+  "▁<wemo_on>": 79,
+  "▁<music_likeness>": 80,
+  "▁<qa_stock>": 81,
+  "▁<iot_cleaning>": 82,
+  "▁<music>": 83,
+  "▁<hue_lightdim>": 84,
+  "▁<definition>": 85,
+  "▁<iot_hue_lightchange>": 86,
+  "▁<querycontact>": 87,
+  "▁<transport_ticket>": 88,
+  "▁<query>": 89,
+  "▁<wemo_off>": 90,
+  "▁<music_dislikeness>": 91
+}
+
+class AsrModel(nn.Module):
+    def __init__(
+        self,
+        encoder_embed: nn.Module,
+        encoder: EncoderInterface,
+        decoder: Optional[nn.Module] = None,
+        joiner: Optional[nn.Module] = None,
+        encoder_dim: int = 384,
+        decoder_dim: int = 512,
+        vocab_size: int = 500,
+        # vocab_size: int = 592,
+        use_transducer: bool = True,
+        use_ctc: bool = False,
+    ):
+        """A joint CTC & Transducer ASR model.
+
+        - Connectionist temporal classification: labelling unsegmented sequence data with recurrent neural networks (http://imagine.enpc.fr/~obozinsg/teaching/mva_gm/papers/ctc.pdf)
+        - Sequence Transduction with Recurrent Neural Networks (https://arxiv.org/pdf/1211.3711.pdf)
+        - Pruned RNN-T for fast, memory-efficient ASR training (https://arxiv.org/pdf/2206.13236.pdf)
+
+        Args:
+          encoder_embed:
+            It is a Convolutional 2D subsampling module. It converts
+            an input of shape (N, T, idim) to an output of of shape
+            (N, T', odim), where T' = (T-3)//2-2 = (T-7)//2.
+          encoder:
+            It is the transcription network in the paper. Its accepts
+            two inputs: `x` of (N, T, encoder_dim) and `x_lens` of shape (N,).
+            It returns two tensors: `logits` of shape (N, T, encoder_dim) and
+            `logit_lens` of shape (N,).
+          decoder:
+            It is the prediction network in the paper. Its input shape
+            is (N, U) and its output shape is (N, U, decoder_dim).
+            It should contain one attribute: `blank_id`.
+            It is used when use_transducer is True.
+          joiner:
+            It has two inputs with shapes: (N, T, encoder_dim) and (N, U, decoder_dim).
+            Its output shape is (N, T, U, vocab_size). Note that its output contains
+            unnormalized probs, i.e., not processed by log-softmax.
+            It is used when use_transducer is True.
+          use_transducer:
+            Whether use transducer head. Default: True.
+          use_ctc:
+            Whether use CTC head. Default: False.
+        """
+        super().__init__()
+
+        assert (
+            use_transducer or use_ctc
+        ), f"At least one of them should be True, but got use_transducer={use_transducer}, use_ctc={use_ctc}"
+
+        assert isinstance(encoder, EncoderInterface), type(encoder)
+
+        self.encoder_embed = encoder_embed
+        self.encoder = encoder
+
+        self.use_transducer = use_transducer
+        if use_transducer:
+            # Modules for Transducer head
+            assert decoder is not None
+            assert hasattr(decoder, "blank_id")
+            assert joiner is not None
+
+            self.decoder = decoder
+            self.joiner = joiner
+
+            self.simple_am_proj = ScaledLinear(
+                encoder_dim, vocab_size, initial_scale=0.25
+            )
+            self.simple_lm_proj = ScaledLinear(
+                decoder_dim, vocab_size, initial_scale=0.25
+            )
+        else:
+            assert decoder is None
+            assert joiner is None
+
+        self.use_ctc = use_ctc
+        if use_ctc:
+            # Modules for CTC head
+            self.ctc_output = nn.Sequential(
+                nn.Dropout(p=0.1),
+                nn.Linear(encoder_dim, vocab_size),
+                nn.LogSoftmax(dim=-1),
+            )
+
+        
+
+        self.intent_classifier = nn.Sequential(
+                nn.Dropout(p=0.1), #0
+                nn.Linear(encoder_dim, 2048), #1
+                nn.ReLU(), #2
+
+                Permute(0, 2, 1),  # (batch, time, dim) -> (batch, dim, time) #3
+                CausalConv1d(dim=2048, width=16, activation="silu"), #4
+                Permute(0, 2, 1),  # back to (batch, time, dim) #5
+
+                nn.ReLU(), #6
+                nn.Linear(2048, 512), #7
+                nn.ReLU(), #8
+                nn.Linear(512, 92) #9
+            )
+
+        
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    
+    @torch.no_grad()
+    def infer_intent_logits(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Encoder-only inference: returns mean-pooled intent logits (N, 92).
+        """
+        # 1) embed  encode
+        x_emb, x_lens_emb = self.encoder_embed(x, x_lens)
+        mask = make_pad_mask(x_lens_emb)
+        x_enc = x_emb.permute(1, 0, 2)           # (T, N, C)
+        enc_out, enc_lens = self.encoder(x_enc, x_lens_emb, mask)
+        enc_out = enc_out.permute(1, 0, 2)       # (N, T, C)
+
+        # 2) framewise logits
+        logits = self.intent_classifier(enc_out)  # (N, T, 92)
+
+        # 3) mask & zero-out padding
+        T = logits.size(1)
+        valid = torch.arange(T, device=enc_out.device).unsqueeze(0) < enc_lens.unsqueeze(1)
+        logits[~valid] = 0.0
+
+        # 4) mean-pool
+        summed = logits.sum(dim=1)                # (N, 92)
+        mean_pooled = summed / enc_lens.unsqueeze(1)  # (N, 92)
+        return mean_pooled
+    
+    
+
+    def forward_encoder(
+        self, x: torch.Tensor, x_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute encoder outputs.
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+
+        Returns:
+          encoder_out:
+            Encoder output, of shape (N, T, C).
+          encoder_out_lens:
+            Encoder output lengths, of shape (N,).
+        """
+        x, x_lens = self.encoder_embed(x, x_lens)
+        
+        return x, x_lens 
+
+
+    
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        supervision_texts: Optional[List[str]] = None,
+        prune_range: int = 5,
+        am_scale: float = 0.0,
+        lm_scale: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          prune_range:
+            The prune range for rnnt loss, it means how many symbols(context)
+            we are considering for each frame to compute the loss.
+          am_scale:
+            The scale to smooth the loss with am (output of encoder network)
+            part
+          lm_scale:
+            The scale to smooth the loss with lm (output of predictor network)
+            part
+        Returns:
+          Return the transducer losses and CTC loss,
+          in form of (simple_loss, pruned_loss, ctc_loss)
+
+        Note:
+           Regarding am_scale & lm_scale, it will make the loss-function one of
+           the form:
+              lm_scale * lm_probs + am_scale * am_probs +
+              (1-lm_scale-am_scale) * combined_probs
+        """
+        # print(f"x shape: {x.shape}")        
+        # # Should be 
+        # # [Batch size (number of sequences/utterances), 
+        # # Number of time frames (sequence length for each utterance after padding), 
+        # # Feature dimension (number of features per frame, such as MFCCs or Mel-spectrogram features)]
+        # print(f"x_lens shape: {x_lens.shape}")  
+        # # Should be 1-dimensional tensor of shape (N,), where each element contains the number of valid frames in the corresponding utterance in x
+        # print(f"Batch size (dim0): {y.dim0}")  # Number of sequences (utterances)
+        # print(f"Total number of labels (tot_size(1)): {y.tot_size(1)}")  # Total labels
+        # print(f"Row splits: {y.shape.row_splits(1)}")  # Row splits for each utterance
+
+        # # To get the length of each sequence (number of labels per sequence)
+        # row_splits = y.shape.row_splits(1)
+        # sequence_lengths = row_splits[1:] - row_splits[:-1]
+        # print(f"Lengths of sequences: {sequence_lengths}")
+
+        # y is a ragged tensor (from the k2 library) with two axes. Its shape is [utt][label], where:
+        # utt: The batch axis (number of utterances).
+        # label: The sequence of target labels for each utterance (could be phonemes, characters, or subword units).
+        # This means y can hold target sequences of variable lengths (e.g., the number of words or characters in each utterance might vary).
+        print(f"#################################################################")  
+
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert y.num_axes == 2, y.num_axes
+
+        assert x.size(0) == x_lens.size(0) == y.dim0, (x.shape, x_lens.shape, y.dim0)
+
+        # encoder_out, encoder_out_lens, intent_loss = self.forward_encoder(x, x_lens, supervision_texts)
+        encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens)
+        return encoder_out, encoder_out_lens
+
+
